@@ -1,0 +1,268 @@
+using Google.Apis.Auth.OAuth2;
+using Google.Apis.Drive.v3;
+using Google.Apis.Download;
+using Google.Apis.Services;
+using Google.Apis.Util.Store;
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace HangFireDemo.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class GoogleDriveController : ControllerBase
+    {
+        private readonly string clientId = "YOUR_CLIENT_ID";
+        private readonly string clientSecret = "YOUR_CLIENT_SECRET";
+        private readonly string applicationName = "DriveUpload";
+        private readonly string username = "YOUR_EMAIL@gmail.com";
+
+        private DriveService GetDriveService()
+        {
+            var tokenResponse = new TokenResponse
+            {
+                AccessToken = "YOUR_ACCESS_TOKEN",
+                RefreshToken = "YOUR_REFRESH_TOKEN"
+            };
+
+            var apiCodeFlow = new GoogleAuthorizationCodeFlow(new GoogleAuthorizationCodeFlow.Initializer
+            {
+                ClientSecrets = new ClientSecrets
+                {
+                    ClientId = clientId,
+                    ClientSecret = clientSecret
+                },
+                Scopes = new[] { DriveService.Scope.Drive },
+                DataStore = new FileDataStore(applicationName)
+            });
+
+            var credential = new UserCredential(apiCodeFlow, username, tokenResponse);
+
+            return new DriveService(new BaseClientService.Initializer
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = applicationName
+            });
+        }
+
+        [HttpPost("CreateFolder")]
+        public ActionResult<string> CreateFolder([FromBody] CreateFolderRequest request)
+        {
+            try
+            {
+                var service = GetDriveService();
+                var folder = FindFolderByName(service, request.FolderName);
+
+                if (folder != null)
+                    return Ok($"Folder already exists with ID: {folder.Id}");
+
+                var folderId = CreateFolderInDrive(service, request.FolderName);
+                return Ok($"Created folder with ID: {folderId}");
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"An error occurred: {ex.Message}");
+            }
+        }
+
+        private string CreateFolderInDrive(DriveService service, string folderName)
+        {
+            var driveFolder = new Google.Apis.Drive.v3.Data.File
+            {
+                Name = folderName,
+                MimeType = "application/vnd.google-apps.folder"
+            };
+
+            return service.Files.Create(driveFolder).Execute().Id;
+        }
+
+        [HttpPost("UploadFile")]
+        public async Task<ActionResult<string>> UploadFile(string folderName)
+        {
+            try
+            {
+                string localFilePath = @"C:\Users\visualapp\Downloads\output.txt";
+                var service = GetDriveService();
+
+                if (!System.IO.File.Exists(localFilePath))
+                    return BadRequest("Local file does not exist.");
+
+                using (var fileStream = new FileStream(localFilePath, FileMode.Open))
+                {
+                    var folder = FindFolderByName(service, folderName);
+
+                    if (folder == null)
+                        throw new Exception($"Folder '{folderName}' not found in Google Drive.");
+
+                    string fileName = Path.GetFileName(((FileStream)fileStream).Name);
+                    var fileMetadata = new Google.Apis.Drive.v3.Data.File
+                    {
+                        Name = fileName,
+                        Parents = new List<string> { folder.Id }
+                    };
+
+                    var request = service.Files.Create(fileMetadata, fileStream, "*/*");
+                    request.Upload();
+
+                    return Ok($"Uploaded file with ID: {fileName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"An error occurred: {ex.Message}");
+            }
+        }
+
+        private Google.Apis.Drive.v3.Data.File FindFolderByName(DriveService service, string folderName)
+        {
+            var request = service.Files.List();
+            request.Q = $"mimeType='application/vnd.google-apps.folder' and name='{folderName}'";
+            request.Fields = "files(id)";
+            var result = request.Execute();
+            return result.Files.FirstOrDefault();
+        }
+
+        [HttpDelete("DeleteFile/{fileName}")]
+        public ActionResult DeleteFile(string fileName)
+        {
+            try
+            {
+                var service = GetDriveService();
+                var file = FindFileByName(service, fileName);
+
+                if (file != null)
+                {
+                    DeleteFileFromDrive(service, file.Id);
+                    return Ok($"Deleted file with name: {fileName}");
+                }
+                else
+                {
+                    return NotFound($"File with name '{fileName}' not found in Google Drive.");
+                }
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"An error occurred: {ex.Message}");
+            }
+        }
+
+        private void DeleteFileFromDrive(DriveService service, string fileId)
+        {
+            var command = service.Files.Delete(fileId);
+            command.Execute();
+        }
+
+        private Google.Apis.Drive.v3.Data.File FindFileByName(DriveService service, string fileName)
+        {
+            try
+            {
+                var request = service.Files.List();
+                request.Q = $"name='{fileName}'";
+                request.Fields = "files(id)";
+                var result = request.Execute();
+
+                if (result.Files != null && result.Files.Count > 0)
+                    return result.Files.FirstOrDefault();
+                else
+                    return null;
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"An error occurred while searching for the file: {ex.Message}", ex);
+            }
+        }
+
+        [HttpGet("GetFiles")]
+        public ActionResult<IList<string>> GetFiles()
+        {
+            try
+            {
+                var service = GetDriveService();
+                var files = GetAllFileNames(service);
+                return Ok(files);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"An error occurred: {ex.Message}");
+            }
+        }
+
+        private IList<string> GetAllFileNames(DriveService service)
+        {
+            var fileList = service.Files.List();
+            fileList.Fields = "nextPageToken, files(name)";
+
+            var result = new List<string>();
+            string pageToken = null;
+
+            do
+            {
+                fileList.PageToken = pageToken;
+                var filesResult = fileList.Execute();
+                var files = filesResult.Files;
+
+                foreach (var file in files)
+                    result.Add(file.Name);
+
+                pageToken = filesResult.NextPageToken;
+            } while (pageToken != null);
+
+            return result;
+        }
+
+        [HttpGet("DownloadFile")]
+        public IActionResult DownloadFile(string fileName)
+        {
+            try
+            {
+                var service = GetDriveService();
+                var file = FindFileByName(service, fileName);
+
+                if (file != null)
+                {
+                    var fileStream = DownloadFileFromDrive(service, file.Id);
+                    return File(fileStream, "application/octet-stream", fileName);
+                }
+                else
+                {
+                    return NotFound($"File with name '{fileName}' not found in Google Drive.");
+                }
+            }
+            catch (Exception ex)
+            {
+                return BadRequest($"An error occurred: {ex.Message}");
+            }
+        }
+
+        private Stream DownloadFileFromDrive(DriveService service, string fileId)
+        {
+            var request = service.Files.Get(fileId);
+            var stream = new MemoryStream();
+            request.MediaDownloader.ProgressChanged += (IDownloadProgress progress) =>
+            {
+                switch (progress.Status)
+                {
+                    case DownloadStatus.Downloading:
+                        break;
+                    case DownloadStatus.Completed:
+                        break;
+                    case DownloadStatus.Failed:
+                        throw new Exception("File download failed.");
+                }
+            };
+
+            request.Download(stream);
+            stream.Seek(0, SeekOrigin.Begin);
+            return stream;
+        }
+    }
+
+    public class CreateFolderRequest
+    {
+        public string FolderName { get; set; }
+    }
+}
